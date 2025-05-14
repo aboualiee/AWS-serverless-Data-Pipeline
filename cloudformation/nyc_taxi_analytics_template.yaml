@@ -1,0 +1,546 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'NYC Taxi Trip Data Analytics Pipeline on AWS'
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: 'nyc-taxi-analytics-project'
+    Description: 'Name of the S3 bucket for the NYC Taxi Analytics project'
+  
+  S3KeyPrefix:
+    Type: String
+    Default: 'raw-data/'
+    Description: 'S3 key prefix for raw data files'
+    
+  SubnetId:
+    Type: String
+    Description: 'The subnet ID where the EMR cluster will be launched'
+    
+  KeyPairName:
+    Type: String
+    Default: 'nyc_keypair'
+    Description: 'The EC2 key pair to use for SSH access to the EMR cluster'
+
+Resources:
+  #--------------------------------------------------------------------------
+  # S3 Resources
+  #--------------------------------------------------------------------------
+  AnalyticsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+
+  #--------------------------------------------------------------------------
+  # IAM Roles
+  #--------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: NYCTaxiLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: NYCTaxiGlueRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: NYCTaxiStepFunctionsRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchEventsFullAccess
+        - arn:aws:iam::aws:policy/AmazonXRayDaemonWriteAccess
+
+  StepFunctionsInlinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: NYCTaxiStepFunctionsInlinePolicy
+      Roles:
+        - !Ref StepFunctionsRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource: !GetAtt DistanceCalculatorFunction.Arn
+          - Effect: Allow
+            Action:
+              - glue:StartJobRun
+              - glue:GetJobRun
+              - glue:GetJobRuns
+              - glue:BatchStopJobRun
+            Resource: '*'
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: NYCTaxiEventBridgeRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchEventsFullAccess
+
+  EventBridgeInlinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: NYCTaxiEventBridgeInlinePolicy
+      Roles:
+        - !Ref EventBridgeRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource: !Ref StateMachine
+
+  EMRServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: NYCTaxiEMRServiceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticmapreduce.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceRole
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+
+  EMRInstanceProfile:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: NYCTaxiEMRRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  EMRInstanceProfileLink:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: NYCTaxiEMRInstanceProfile
+      Roles:
+        - !Ref EMRInstanceProfile
+
+  #--------------------------------------------------------------------------
+  # Lambda Function
+  #--------------------------------------------------------------------------
+  DistanceCalculatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: NYCTaxiDistanceCalculator
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 2048
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import pandas as pd
+          import math
+          import numpy as np
+          from io import StringIO
+
+          s3 = boto3.client('s3')
+
+          def haversine_distance(lat1, lon1, lat2, lon2):
+              """Calculate haversine distance between two points"""
+              # Convert decimal degrees to radians
+              lon1, lat1, lon2, lat2 = map(math.radians, [lon1, lat1, lon2, lat2])
+              
+              # Haversine formula
+              dlon = lon2 - lon1
+              dlat = lat2 - lat1
+              a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+              c = 2 * math.asin(math.sqrt(a))
+              r = 6371  # Radius of earth in kilometers
+              return c * r
+
+          def manhattan_distance(lat1, lon1, lat2, lon2):
+              """Calculate Manhattan distance (approximation in urban grid)"""
+              # Constants for NYC (approximate conversion from lat/lon to km)
+              lat_km = 111  # 1 degree latitude = ~111 km
+              lon_km = 85   # 1 degree longitude = ~85 km at NYC's latitude
+              
+              # Calculate distance
+              lat_dist = abs(lat2 - lat1) * lat_km
+              lon_dist = abs(lon2 - lon1) * lon_km
+              
+              return lat_dist + lon_dist
+
+          def lambda_handler(event, context):
+              # Print the event for debugging
+              print("Received event:", json.dumps(event, indent=2))
+              
+              try:
+                  # Get bucket and key from the S3 event
+                  if 'Records' in event:
+                      # Direct S3 event
+                      bucket = event['Records'][0]['s3']['bucket']['name']
+                      key = event['Records'][0]['s3']['object']['key']
+                  elif 'detail' in event:
+                      # EventBridge event
+                      bucket = event['detail']['bucket']['name']
+                      key = event['detail']['object']['key']
+                  else:
+                      # Manual test event
+                      bucket = event.get('bucket', 'nyc-taxi-analytics-project')
+                      key = event.get('key', 'raw-data/train.csv')
+                  
+                  print(f"Processing file {key} from bucket {bucket}")
+                  
+                  # Get the object from S3
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  csv_content = response['Body'].read().decode('utf-8')
+                  
+                  # Parse CSV
+                  df = pd.read_csv(StringIO(csv_content))
+                  print(f"Read {len(df)} rows from CSV")
+                  
+                  # Calculate distances
+                  df['haversine_distance'] = df.apply(
+                      lambda row: haversine_distance(
+                          row['pickup_latitude'], 
+                          row['pickup_longitude'], 
+                          row['dropoff_latitude'], 
+                          row['dropoff_longitude']
+                      ), axis=1
+                  )
+                  
+                  df['manhattan_distance'] = df.apply(
+                      lambda row: manhattan_distance(
+                          row['pickup_latitude'], 
+                          row['pickup_longitude'], 
+                          row['dropoff_latitude'], 
+                          row['dropoff_longitude']
+                      ), axis=1
+                  )
+                  
+                  print("Distance calculations complete")
+                  
+                  # Save the enriched data back to S3
+                  # Extract just the filename from the key
+                  filename = key.split('/')[-1]
+                  output_key = f"processed-data/{filename}"
+                  
+                  csv_buffer = StringIO()
+                  df.to_csv(csv_buffer, index=False)
+                  
+                  s3.put_object(
+                      Bucket=bucket,  # Use the same bucket
+                      Key=output_key,
+                      Body=csv_buffer.getvalue()
+                  )
+                  
+                  print(f"Saved processed file to s3://{bucket}/{output_key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Successfully processed {key} and calculated distances'),
+                      'processedFile': output_key
+                  }
+              
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  import traceback
+                  print(traceback.format_exc())
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error processing file: {str(e)}')
+                  }
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python39:9
+
+  #--------------------------------------------------------------------------
+  # Glue Resources
+  #--------------------------------------------------------------------------
+  TaxiAnalyticsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: nyc_taxi_analytics
+        Description: 'Database for NYC Taxi Analytics'
+
+  GlueETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: NYCTaxiETLJob
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: '3.0'
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${BucketName}/scripts/glue_etl_script.py
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': 'python'
+        '--bucket-name': !Ref BucketName
+        '--hive-metastore-database': 'nyc_taxi_analytics'
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxCapacity: 2.0
+      Timeout: 30
+      NumberOfWorkers: 2
+      WorkerType: 'G.1X'
+
+  #--------------------------------------------------------------------------
+  # EMR Cluster
+  #--------------------------------------------------------------------------
+  NYCTaxiEMRCluster:
+    Type: AWS::EMR::Cluster
+    Properties:
+      Name: NYCTaxiEMRCluster
+      ReleaseLabel: emr-7.8.0
+      Applications:
+        - Name: Hadoop
+        - Name: Hive
+        - Name: Spark
+      Instances:
+        MasterInstanceGroup:
+          InstanceCount: 1
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Primary
+        CoreInstanceGroup:
+          InstanceCount: 2
+          InstanceType: m5.xlarge
+          Market: ON_DEMAND
+          Name: Core
+        TerminationProtected: false
+        Ec2KeyName: !Ref KeyPairName
+        Ec2SubnetId: !Ref SubnetId
+      VisibleToAllUsers: true
+      JobFlowRole: NYCTaxiEMRInstanceProfile
+      ServiceRole: !Ref EMRServiceRole
+      AutoTerminationPolicy:
+        IdleTimeout: 3600
+      Tags:
+        - Key: Project
+          Value: NYCTaxiAnalytics
+      Configurations:
+        - Classification: spark
+          ConfigurationProperties:
+            maximizeResourceAllocation: true
+        - Classification: spark-defaults
+          ConfigurationProperties:
+            spark.driver.memory: 4G
+            spark.executor.memory: 4G
+      LogUri: !Sub s3://${BucketName}/emr-logs/
+
+  #--------------------------------------------------------------------------
+  # EMR Step for Spark Application
+  #--------------------------------------------------------------------------
+  NYCTaxiSparkStep:
+    Type: AWS::EMR::Step
+    DependsOn: NYCTaxiEMRCluster
+    Properties:
+      JobFlowId: !Ref NYCTaxiEMRCluster
+      Name: NYCTaxiSparkAnalysis
+      ActionOnFailure: CONTINUE
+      HadoopJarStep:
+        Jar: command-runner.jar
+        Args:
+          - spark-submit
+          - --deploy-mode
+          - client
+          - --conf
+          - spark.driver.memory=4g
+          - --conf
+          - spark.executor.memory=4g
+          - !Sub s3://${BucketName}/scripts/nyc_taxi_spark_analysis.py
+
+  #--------------------------------------------------------------------------
+  # Step Functions State Machine
+  #--------------------------------------------------------------------------
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: NYCTaxiProcessingWorkflow
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      Definition:
+        Comment: NYC Taxi Data Processing Workflow
+        StartAt: CalculateDistances
+        States:
+          CalculateDistances:
+            Type: Task
+            Resource: !GetAtt DistanceCalculatorFunction.Arn
+            Next: RunGlueETL
+            Retry:
+              - ErrorEquals:
+                  - States.ALL
+                IntervalSeconds: 3
+                MaxAttempts: 2
+                BackoffRate: 1.5
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                Next: ProcessingFailed
+          RunGlueETL:
+            Type: Task
+            Resource: arn:aws:states:::glue:startJobRun.sync
+            Parameters:
+              JobName: !Ref GlueETLJob
+            Next: ProcessingSucceeded
+            Catch:
+              - ErrorEquals:
+                  - States.ALL
+                Next: ProcessingFailed
+          ProcessingSucceeded:
+            Type: Succeed
+          ProcessingFailed:
+            Type: Fail
+            Cause: Data processing workflow failed
+      StateMachineType: STANDARD
+      TracingConfiguration:
+        Enabled: true
+
+  #--------------------------------------------------------------------------
+  # EventBridge Rule
+  #--------------------------------------------------------------------------
+  S3UploadEventRule:
+    Type: AWS::Events::Rule
+    DependsOn: [StateMachine, EventBridgeRole]
+    Properties:
+      Name: NYCTaxiS3EventRule
+      Description: 'Triggers Step Functions when new taxi data is uploaded to S3 or storage class changes'
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+          - Object Storage Class Changed
+        detail:
+          bucket:
+            name:
+              - !Ref BucketName
+          object:
+            key:
+              - prefix: !Ref S3KeyPrefix
+      State: ENABLED
+      Targets:
+        - Arn: !Ref StateMachine
+          Id: TaxiProcessingTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  #--------------------------------------------------------------------------
+  # Athena Resources
+  #--------------------------------------------------------------------------
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: NYCTaxiAnalyticsWorkGroup
+      Description: WorkGroup for NYC Taxi Analytics queries
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${BucketName}/athena-results/
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824 # 1 GB
+
+Outputs:
+  BucketName:
+    Description: 'The name of the S3 bucket'
+    Value: !Ref BucketName
+
+  LambdaFunction:
+    Description: 'The Lambda function for distance calculation'
+    Value: !Ref DistanceCalculatorFunction
+
+  GlueJob:
+    Description: 'The Glue ETL job'
+    Value: !Ref GlueETLJob
+  
+  GlueScriptLocation:
+    Description: 'The location where you need to manually upload the Glue ETL script'
+    Value: !Sub s3://${BucketName}/scripts/glue_etl_script.py
+
+  StateMachine:
+    Description: 'The Step Functions state machine'
+    Value: !Ref StateMachine
+
+  EventBridgeRule:
+    Description: 'The EventBridge rule for S3 uploads'
+    Value: !Ref S3UploadEventRule
+
+  AthenaWorkGroupName:
+    Description: 'The Athena WorkGroup for queries'
+    Value: !Ref AthenaWorkGroup
+  
+  AthenaOutputLocation:
+    Description: 'The location where you need to manually create the Athena results folder'
+    Value: !Sub s3://${BucketName}/athena-results/
+    
+  EMRCluster:
+    Description: 'The EMR cluster for Spark processing'
+    Value: !Ref NYCTaxiEMRCluster
+
+  EMRSparkStep:
+    Description: 'The Spark step added to the EMR cluster'
+    Value: !Ref NYCTaxiSparkStep
+
+  SparkApplicationLocation:
+    Description: 'The location where you need to manually upload the Spark application script'
+    Value: !Sub s3://${BucketName}/scripts/nyc_taxi_spark_analysis.py
+
+  ManualSetupNote:
+    Description: 'Important: Manual steps required after deployment'
+    Value: !Sub |
+      After deploying this stack, you must manually:
+      1) Upload the Glue ETL script to s3://${BucketName}/scripts/glue_etl_script.py
+      2) Upload the Spark application script to s3://${BucketName}/scripts/nyc_taxi_spark_analysis.py
+      3) Create the Athena results folder at s3://${BucketName}/athena-results/
+      4) Create the EMR logs folder at s3://${BucketName}/emr-logs/

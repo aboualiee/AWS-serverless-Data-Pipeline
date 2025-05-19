@@ -51,7 +51,7 @@ Before deploying the infrastructure, ensure you have:
 ![Infrastructure Composer View](images/infrastructure_composer.png)  
 
 5. **Specify Stack Details**:  
-![Stack Name Configuration](images/stacking.png)  
+![Stack Name Configuration](../images/stacking.png)  
    - Stack name: `nycstack`  
    - Parameters:  
      - `BucketName`: `nyc-taxi-analytics-project`  

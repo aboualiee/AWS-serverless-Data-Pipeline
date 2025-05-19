@@ -48,7 +48,7 @@ Before deploying the infrastructure, ensure you have:
      `https://nyc-taxi-analytics-project.s3.eu-north-1.amazonaws.com/cloudformation/nyc_taxi_analytics_template.yaml`  
 
 4. *(Optional)* Click **View in Infrastructure Composer** for a visual layout and validation  
-![Infrastructure Composer View](images/infrastructure_composer.png)  
+![Infrastructure Composer View](../images/infrastructure_composer.png)  
 
 5. **Specify Stack Details**:  
 ![Stack Name Configuration](../images/stacking.png)  

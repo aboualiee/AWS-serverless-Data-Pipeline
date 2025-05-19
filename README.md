@@ -17,7 +17,7 @@ A scalable, serverless analytics pipeline built on AWS for processing and analyz
 ## Architecture
 
 ![NYC Taxi Analytics Architecture](images/architecture-diagram.png)  
-*Fig 1: NYC Taxi Analytics Data Flow Architecture*
+*Fig 1: NYC Taxi Analytics AWS Architecture*
 
 ### Architecture Components:
 
